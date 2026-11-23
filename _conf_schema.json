@@ -437,5 +437,12 @@
     "default": 120,
     "hint": "群聊中@机器人唤醒后，该时间范围内无需重复@即可继续对话，默认 120 秒（2分钟）",
     "invisible": true
+  },
+  "passthrough_plugins": {
+    "description": "消息放行插件列表",
+    "type": "list",
+    "default": [],
+    "hint": "选择后，消息会立即放行给这些插件，无需等待本插件处理完成；留空则拦截消息，不放行给其他插件",
+    "invisible": true
   }
 }

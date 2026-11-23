@@ -125,6 +125,8 @@ def _plugin_data_dir() -> str:
 
 PLUGIN_NAME = "astrbot_plugin_mimotts"
 
+REPLY_PENDING_KEY = f"{PLUGIN_NAME}:reply_pending"
+
 PERSONAS_KEY = f"{PLUGIN_NAME}:personas"
 MEMORY_DIR_NAME = "long_memory"
 
@@ -434,6 +436,7 @@ DEFAULT_CONFIG = {
     "master_user_ids": [],
     "avoid_intimate_non_master": True,
     "enable_noprefix_command": True,
+    "passthrough_plugins": [],
 }
 
 
@@ -469,6 +472,9 @@ class CustomChatLLM(Star):
             self.api_save_config,
             ["POST"],
             "保存配置",
+        )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/plugins", self.api_get_plugins, ["GET"], "获取已安装插件列表"
         )
         logger.info(f"[MiMo TTS] Web API端点注册完成")
         context.register_web_api(
@@ -1909,6 +1915,18 @@ class CustomChatLLM(Star):
 
     # ===================== 对话入口 =====================
 
+    def _handler_plugin_name(self, handler) -> str:
+        """返回某个消息处理器所属插件的名称。"""
+        module_path = getattr(handler, "handler_module_path", "") or ""
+        for star in self.context.get_all_stars():
+            star_module = star.module_path or ""
+            if star_module and (
+                module_path == star_module
+                or module_path.startswith(star_module + ".")
+            ):
+                return star.name or star.module_path or ""
+        return module_path
+
     @filter.event_message_type(filter.EventMessageType.ALL, priority=inf)
     async def chat_main(self, event: AstrMessageEvent):
         """监听所有消息，判断是否由本插件响应。"""
@@ -1931,16 +1949,22 @@ class CustomChatLLM(Star):
         # 私聊中其他插件的指令已命中时直接放行，避免本插件拦截其指令
         own_prefix = f"{self.__class__.__module__}_"
         activated = event.get_extra("activated_handlers", []) or []
-        if event.is_private_chat() and any(
-            not h.handler_full_name.startswith(own_prefix)
+        passthrough = set(self.config.get("passthrough_plugins", []) or [])
+        other_cmd_handlers = [
+            h
+            for h in activated
+            if not h.handler_full_name.startswith(own_prefix)
             and any(
                 type(f).__name__ in ("CommandFilter", "CommandGroupFilter", "RegexFilter")
                 for f in h.event_filters
             )
-            for h in activated
-        ):
-            logger.debug("[MiMo_TTS] 私聊中检测到其他插件指令，放行")
-            return
+        ]
+        if event.is_private_chat() and other_cmd_handlers:
+            if not passthrough or any(
+                self._handler_plugin_name(h) in passthrough for h in other_cmd_handlers
+            ):
+                logger.debug("[MiMo_TTS] 私聊中检测到其他插件指令，放行")
+                return
 
         # 指令消息检测：本插件或其他插件以 / 开头的指令均不触发 AI 回复
         is_command = text.startswith("/") or any(
@@ -1997,8 +2021,19 @@ class CustomChatLLM(Star):
                     'song_name': song_name,
                     'custom_lyrics': custom_lyrics
                 }
-                await self._do_chat(event)
-                event.stop_event()
+                if passthrough:
+                    activated[:] = [
+                        h
+                        for h in activated
+                        if h.handler_module_path
+                        in (self.__class__.__module__, PLUGIN_NAME)
+                        or self._handler_plugin_name(h) in passthrough
+                    ]
+                    event.call_llm = True
+                    event.set_extra(REPLY_PENDING_KEY, True)
+                else:
+                    await self._do_chat(event)
+                    event.stop_event()
                 return
 
         # ============ 群聊分支（is_at_bot / self_id 等仅群聊需要） ============
@@ -2080,9 +2115,27 @@ class CustomChatLLM(Star):
             self.active_sessions[key] = now + session_expire
 
         logger.info("[MiMo_TTS] 检测到聊天/图片消息，准备响应")
-        await self._do_chat(event)
-        event.stop_event()  # 阻止 AstrBot 默认对话响应
+        if passthrough:
+            activated[:] = [
+                h
+                for h in activated
+                if h.handler_module_path in (self.__class__.__module__, PLUGIN_NAME)
+                or self._handler_plugin_name(h) in passthrough
+            ]
+            event.call_llm = True
+            event.set_extra(REPLY_PENDING_KEY, True)
+        else:
+            await self._do_chat(event)
+            event.stop_event()  # 阻止 AstrBot 默认对话响应
         return
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-inf)
+    async def chat_reply(self, event: AstrMessageEvent) -> None:
+        """在放行插件处理完毕后，由本处理器完成本插件回复。"""
+        if not event.get_extra(REPLY_PENDING_KEY, False):
+            return
+        event.set_extra(REPLY_PENDING_KEY, False)
+        await self._do_chat(event)
 
     def _extract_emoji_meanings(self, text: str) -> str:
         """提取消息中可识别的 Emoji 表情并返回含义描述。"""
@@ -3093,6 +3146,33 @@ class CustomChatLLM(Star):
             logger.error(f"加载配置失败: {e}", exc_info=True)
             return error_response(f"加载配置失败: {e}")
 
+    async def api_get_plugins(self):
+        """返回已安装的插件列表及当前消息放行选择，供控制界面多选使用。"""
+        plugins = []
+        try:
+            for star in self.context.get_all_stars():
+                name = star.name or star.module_path or ""
+                if not name or name == PLUGIN_NAME:
+                    continue
+                plugins.append(
+                    {
+                        "name": name,
+                        "display_name": star.display_name or name,
+                        "desc": star.desc or star.short_desc or "",
+                        "module_path": star.module_path or "",
+                        "activated": bool(getattr(star, "activated", True)),
+                    }
+                )
+        except Exception as e:
+            logger.error(f"获取插件列表失败: {e}")
+        plugins.sort(key=lambda p: (not p["activated"], p["display_name"].lower()))
+        return json_response(
+            {
+                "list": plugins,
+                "selected": self.config.get("passthrough_plugins", []) or [],
+            }
+        )
+
     def _list_providers(self) -> list[dict]:
         """返回 AstrBot 已配置的聊天模型提供商列表。"""
         providers = []
@@ -3220,6 +3300,7 @@ class CustomChatLLM(Star):
                  "max_log", "on_thinking", "session_expire_seconds",
                 "enable_favorability", "favorability_default",
                 "enable_private_companion", "master_user_ids", "avoid_intimate_non_master",
+                "passthrough_plugins",
             ]
             for key in editable_keys:
                 if key in payload:

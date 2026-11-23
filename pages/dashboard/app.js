@@ -8,6 +8,8 @@ let personas = [];
 let editingPersonaId = null;
 let ttsVoices = [];
 let astrbotCurrentPersonaName = "";
+let installedPlugins = [];
+let passthroughSelected = [];
 
 // 兜底音色表（后端未返回时使用，与后端 TTS_VOICES 保持一致的中文描述）
 const FALLBACK_TTS_VOICES = [
@@ -109,6 +111,74 @@ function renderStatus(status) {
     pill.innerHTML = `<span class="dot ${it.on ? "on" : "off"}"></span>${escapeHtml(it.label)}`;
     pills.appendChild(pill);
   });
+}
+
+// ===================== 消息放行插件选择 =====================
+
+function renderPassthroughSummary() {
+  const el = $("passthroughSummary");
+  if (!el) return;
+  const names = passthroughSelected.map((name) => {
+    const p = installedPlugins.find((x) => x.name === name);
+    return p ? p.display_name : name;
+  });
+  el.textContent = "已放行插件：" + (names.length ? names.join("、") : "-");
+}
+
+async function loadPassthroughPlugins() {
+  try {
+    const data = await bridge.apiGet("plugins");
+    installedPlugins = (data && data.list) || [];
+    if (data && Array.isArray(data.selected)) {
+      passthroughSelected = data.selected.slice();
+    }
+    renderPassthroughSummary();
+  } catch (e) {
+    showToast("插件列表加载失败：" + e.message, true);
+  }
+}
+
+function renderPassthroughList() {
+  const list = $("passthroughList");
+  if (!list) return;
+  if (!installedPlugins.length) {
+    list.innerHTML = '<div class="empty">未检测到其他已安装插件</div>';
+    return;
+  }
+  list.innerHTML = "";
+  installedPlugins.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "plugin-item";
+    const checked = passthroughSelected.includes(p.name) ? "checked" : "";
+    row.innerHTML =
+      `<input type="checkbox" data-plugin="${escapeHtml(p.name)}" ${checked} />` +
+      `<div class="info">` +
+      `<div class="name">${escapeHtml(p.display_name)}${p.activated ? "" : "（未启用）"}</div>` +
+      (p.desc ? `<div class="desc">${escapeHtml(p.desc)}</div>` : "") +
+      `</div>`;
+    list.appendChild(row);
+  });
+  list.querySelectorAll('input[type="checkbox"]').forEach((box) => {
+    box.addEventListener("change", () => {
+      if (box.checked) {
+        if (!passthroughSelected.includes(box.dataset.plugin)) {
+          passthroughSelected.push(box.dataset.plugin);
+        }
+      } else {
+        passthroughSelected = passthroughSelected.filter((n) => n !== box.dataset.plugin);
+      }
+    });
+  });
+}
+
+async function openPassthroughModal() {
+  await loadPassthroughPlugins();
+  renderPassthroughList();
+  $("passthroughModal").classList.add("show");
+}
+
+function closePassthroughModal() {
+  $("passthroughModal").classList.remove("show");
 }
 
 // ===================== 人格库管理 =====================
@@ -325,6 +395,7 @@ function collectConfig() {
     on_thinking: $("on_thinking").value === "true",
     proactive_chat_frequency: parseInt($("proactive_chat_frequency").value, 10) || 10,
     favorability_default: parseInt($("favorability_default").value, 10) || 50,
+    passthrough_plugins: passthroughSelected.slice(),
   };
 }
 
@@ -456,6 +527,10 @@ function applyConfig(config) {
   $("on_thinking").value = config.on_thinking ? "true" : "false";
   $("proactive_chat_frequency").value = config.proactive_chat_frequency || 10;
   $("favorability_default").value = config.favorability_default || 50;
+  if (Array.isArray(config.passthrough_plugins)) {
+    passthroughSelected = config.passthrough_plugins.slice();
+    renderPassthroughSummary();
+  }
 }
 
 function syncSingDirectorVisibility() {
@@ -735,7 +810,7 @@ async function init() {
       ttsVoices = vRes.voices;
     }
   } catch (_) { /* 使用兜底表 */ }
-  await Promise.all([loadStatus(), loadPersonas()]);
+  await Promise.all([loadStatus(), loadPersonas(), loadPassthroughPlugins()]);
   try {
     const config = await bridge.apiGet("config");
     applyConfig(config);
@@ -960,6 +1035,31 @@ $("btnClearMemory").addEventListener("click", async () => {
   }
 });
 
-init();
+$("btnOpenPassthrough").addEventListener("click", openPassthroughModal);
+$("passthroughCancel").addEventListener("click", closePassthroughModal);
+$("btnPassthroughAll").addEventListener("click", () => {
+  passthroughSelected = installedPlugins.map((p) => p.name);
+  renderPassthroughList();
+});
+$("btnPassthroughNone").addEventListener("click", () => {
+  passthroughSelected = [];
+  renderPassthroughList();
+});
+$("passthroughSave").addEventListener("click", async () => {
+  const btn = $("passthroughSave");
+  btn.disabled = true;
+  try {
+    await bridge.apiPost("config/save", {
+      passthrough_plugins: passthroughSelected.slice(),
+    });
+    renderPassthroughSummary();
+    closePassthroughModal();
+    showToast("✅ 消息放行插件已保存", false, true);
+  } catch (e) {
+    showToast("保存失败：" + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 init();
